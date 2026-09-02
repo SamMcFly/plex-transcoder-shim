@@ -19,7 +19,9 @@ param(
     [string]$ShimBinary = (Join-Path (Split-Path $PSScriptRoot -Parent) 'dist\PlexTranscoderShim.exe'),
     [string]$ConfigTemplate = (Join-Path (Split-Path $PSScriptRoot -Parent) 'config\shim.ini.example'),
     [string]$BackupRoot = (Join-Path $env:ProgramData 'PlexTranscoderShim\Backups'),
-    [switch]$StopPlex
+    [switch]$StopPlex,
+    [switch]$AllowUnverifiedNative,
+    [Parameter(DontShow)][switch]$TestMode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,18 +44,47 @@ function Get-ExecutableKind {
     catch { return 'native' }
 }
 
+function Get-PlexSignatureInfo {
+    param([Parameter(Mandatory)][string]$Path)
+    if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){
+        return [pscustomobject]@{Status='Missing';Signer='';IsPlex=$false}
+    }
+    $signature=Get-AuthenticodeSignature -LiteralPath $Path
+    $signer=if($signature.SignerCertificate){$signature.SignerCertificate.Subject}else{''}
+    $isPlex=$signature.Status -eq 'Valid' -and $signer -match '(?i)(CN|O)\s*=\s*"?Plex(?:,\s*|\s+)Inc\.?"?'
+    return [pscustomobject]@{Status=[string]$signature.Status;Signer=$signer;IsPlex=$isPlex}
+}
+
+function Assert-PlexNativeExecutable {
+    param([Parameter(Mandatory)][string]$Path)
+    if((Get-ExecutableKind -Path $Path) -ne 'native'){
+        throw "Expected a native Plex executable: $Path"
+    }
+    $signature=Get-PlexSignatureInfo -Path $Path
+    if($signature.IsPlex){return}
+    $detail="Authenticode status=$($signature.Status), signer='$($signature.Signer)'"
+    if($AllowUnverifiedNative){
+        Write-Warning "Proceeding with an unverified native executable because -AllowUnverifiedNative was supplied: $Path ($detail)"
+        return
+    }
+    throw "Refusing to use an unverified native executable: $Path ($detail). Repair/reinstall Plex, or inspect the file and explicitly pass -AllowUnverifiedNative."
+}
+
 function Get-FileDescription {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [pscustomobject]@{ Path=$Path; Kind='missing'; Size=$null; Modified=$null; SHA256=$null }
     }
     $item = Get-Item -LiteralPath $Path
+    $signature=if($item.Extension -eq '.exe'){Get-PlexSignatureInfo -Path $Path}else{$null}
     return [pscustomobject]@{
         Path=$Path
         Kind=Get-ExecutableKind -Path $Path
         Size=$item.Length
         Modified=$item.LastWriteTimeUtc.ToString('o')
         SHA256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+        AuthenticodeStatus=if($signature){$signature.Status}else{$null}
+        Signer=if($signature){$signature.Signer}else{$null}
     }
 }
 
@@ -64,16 +95,31 @@ function Show-Status {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             $item=Get-Item -LiteralPath $path
             $kind=if($item.Extension -eq '.exe'){Get-ExecutableKind -Path $path}else{'data'}
-            Write-Host ('  {0,-28} {1,-8} {2,10:N0} bytes  {3:u}' -f $item.Name,$kind,$item.Length,$item.LastWriteTimeUtc)
+            if($kind -eq 'native'){
+                $signature=Get-PlexSignatureInfo -Path $path
+                $kind=if($signature.IsPlex){'plex-native'}else{"unverified/$($signature.Status)"}
+            }
+            Write-Host ('  {0,-28} {1,-18} {2,10:N0} bytes  {3:u}' -f $item.Name,$kind,$item.Length,$item.LastWriteTimeUtc)
         }
         else { Write-Host ('  {0,-28} missing' -f (Split-Path $path -Leaf)) -ForegroundColor DarkGray }
     }
-    $running=@(Get-Process -Name $plexProcessNames -ErrorAction SilentlyContinue)
-    Write-Host ('Plex processes: ' + $(if($running){($running.Name | Sort-Object -Unique) -join ', '}else{'stopped'}))
+    $running=if($TestMode){@()}else{@(Get-Process -Name $plexProcessNames -ErrorAction SilentlyContinue)}
+    $processState=if($TestMode){'not checked (TestMode)'}elseif($running){($running.Name | Sort-Object -Unique) -join ', '}else{'stopped'}
+    Write-Host "Plex processes: $processState"
     Write-Host ''
 }
 
 function Assert-Administrator {
+    if($TestMode){
+        $tempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
+        foreach($candidate in @($PlexDirectory,$BackupRoot)){
+            $full=[IO.Path]::GetFullPath($candidate).TrimEnd('\')+'\'
+            if(-not $full.StartsWith($tempRoot,[StringComparison]::OrdinalIgnoreCase) -or $full -eq $tempRoot){
+                throw "TestMode only permits isolated subdirectories beneath $tempRoot"
+            }
+        }
+        return
+    }
     $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
     $principal=[Security.Principal.WindowsPrincipal]::new($identity)
     if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
@@ -82,6 +128,7 @@ function Assert-Administrator {
 }
 
 function Stop-PlexForChange {
+    if($TestMode){return}
     $running=@(Get-Process -Name $plexProcessNames -ErrorAction SilentlyContinue)
     if(-not $running){return}
     if(-not $StopPlex){
@@ -177,6 +224,8 @@ switch($Action){
         if($activeKind -eq 'native' -and $realKind -ne 'missing'){
             throw 'A preserved transcoder already exists. Use -Action Repair after a Plex update.'
         }
+        if($activeKind -eq 'native'){Assert-PlexNativeExecutable -Path $active}
+        if($activeKind -eq 'shim'){Assert-PlexNativeExecutable -Path $real}
         Stop-PlexForChange
         [void](New-StateBackup -Reason 'install')
         if($activeKind -eq 'native'){Copy-FileSafely -Source $active -Destination $real}
@@ -188,6 +237,8 @@ switch($Action){
         if($activeKind -ne 'native' -or $realKind -ne 'native'){
             throw "Repair expects Plex's current native transcoder at the active path and an older native copy at the preserved path. Found active=$activeKind, preserved=$realKind."
         }
+        Assert-PlexNativeExecutable -Path $active
+        Assert-PlexNativeExecutable -Path $real
         Stop-PlexForChange
         [void](New-StateBackup -Reason 'repair')
         Copy-FileSafely -Source $active -Destination $real
@@ -203,6 +254,7 @@ switch($Action){
         if($activeKind -ne 'shim' -or $realKind -ne 'native'){
             throw "Safe uninstall requires active=shim and preserved=native. Found active=$activeKind, preserved=$realKind."
         }
+        Assert-PlexNativeExecutable -Path $real
         Stop-PlexForChange
         [void](New-StateBackup -Reason 'uninstall')
         Copy-FileSafely -Source $real -Destination $active

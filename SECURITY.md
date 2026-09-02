@@ -28,3 +28,7 @@ patterns, but it cannot guarantee removal of every secret format.
 Keep logs access-controlled, retain only what is needed, and sanitize excerpts
 before sharing them. Set `log = 0` if command-line logging is unacceptable;
 the activity portion of the health checker will then be unavailable.
+
+By default logs are stored under the Plex process account's local application
+data directory, not beside the executable in `Program Files`. An explicit log
+path must be absolute and writable by that account.

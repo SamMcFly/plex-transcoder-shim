@@ -16,6 +16,8 @@ $flags=[Reflection.BindingFlags]'NonPublic,Static'
 $rewrite=$type.GetMethod('Rewrite',$flags)
 $redact=$type.GetMethod('RedactSensitiveLogText',$flags)
 $validate=$type.GetMethod('ValidateConfig',$flags)
+$parseBoolean=$type.GetMethod('ParseBoolean',$flags)
+$getDefaultLog=$type.GetMethod('GetDefaultLogFile',$flags)
 
 function Set-PrivateField([string]$Name,$Value){$type.GetField($Name,$flags).SetValue($null,$Value)}
 function Reset-Config {
@@ -26,10 +28,22 @@ function Reset-Config {
     Set-PrivateField '_bufsizeFactor' ([double]0.0)
     Set-PrivateField '_extraArgs' ''
     Set-PrivateField '_logMaxBytes' ([long](5MB))
+    Set-PrivateField '_logFile' (Join-Path ([IO.Path]::GetTempPath()) 'PlexTranscoderShim.Tests\shim.log')
 }
 function Invoke-Rewrite([string]$Arguments){return [string]$rewrite.Invoke($null,@($Arguments))}
 function Assert-Match([string]$Value,[string]$Pattern,[string]$Message){if($Value -notmatch $Pattern){throw "$Message`nActual: $Value"}}
 function Assert-NoMatch([string]$Value,[string]$Pattern,[string]$Message){if($Value -match $Pattern){throw "$Message`nActual: $Value"}}
+function Test-InnerExceptionType($Exception,[type]$Expected){
+    for($cursor=$Exception;$cursor;$cursor=$cursor.InnerException){if($Expected.IsInstanceOfType($cursor)){return $true}}
+    return $false
+}
+
+if(-not [IO.Path]::IsPathRooted([string]$getDefaultLog.Invoke($null,@()))){throw 'Default log path is not absolute.'}
+if(-not [bool]$parseBoolean.Invoke($null,@('enabled','yes'))){throw 'A documented true value was rejected.'}
+if([bool]$parseBoolean.Invoke($null,@('enabled','off'))){throw 'A documented false value was accepted as true.'}
+$invalidBooleanCaught=$false
+try{[void]$parseBoolean.Invoke($null,@('enabled','ture'))}catch{$invalidBooleanCaught=Test-InnerExceptionType $_.Exception ([IO.InvalidDataException])}
+if(-not $invalidBooleanCaught){throw 'An invalid Boolean value did not raise a configuration error.'}
 
 Reset-Config
 $basic=Invoke-Rewrite '-codec:0 hevc -i "movie.mkv" -codec:0 hevc_qsv -q:0 20 -maxrate:0 10000k -bufsize:0 20000k'
@@ -63,7 +77,13 @@ Assert-Match $sanitized '<redacted>' 'Redaction marker is missing.'
 Reset-Config
 Set-PrivateField '_bitrateFactor' ([double]1.1)
 $invalidCaught=$false
-try{[void]$validate.Invoke($null,@())}catch{if($_.Exception.InnerException -is [IO.InvalidDataException]){$invalidCaught=$true}}
+try{[void]$validate.Invoke($null,@())}catch{$invalidCaught=Test-InnerExceptionType $_.Exception ([IO.InvalidDataException])}
 if(-not $invalidCaught){throw 'Unsafe bitrate_factor was not rejected.'}
+
+Reset-Config
+Set-PrivateField '_logFile' 'relative\shim.log'
+$invalidLogCaught=$false
+try{[void]$validate.Invoke($null,@())}catch{$invalidLogCaught=Test-InnerExceptionType $_.Exception ([IO.InvalidDataException])}
+if(-not $invalidLogCaught){throw 'A relative logfile path was not rejected.'}
 
 Write-Host 'All rewrite tests passed.' -ForegroundColor Green

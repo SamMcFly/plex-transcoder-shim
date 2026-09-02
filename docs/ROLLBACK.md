@@ -33,6 +33,8 @@ The script refuses to proceed unless all of these are true:
 
 - The active `Plex Transcoder.exe` identifies as `PlexTranscoderShim`.
 - `Plex Transcoder Real.exe` exists and identifies as a native executable.
+- The preserved native executable has a valid `Plex, Inc.` Authenticode
+  signature, unless `-AllowUnverifiedNative` was explicitly supplied.
 - Plex is stopped, or `-StopPlex` was explicitly supplied.
 
 It backs up the current state, restores the preserved native executable to
@@ -68,7 +70,16 @@ try {
 ```
 
 The preserved Plex executable should report `native executable`. If it reports
-`PlexTranscoderShim`, stop: the original is not in the expected location.
+`PlexTranscoderShim`, stop: the original is not in the expected location. Also
+verify its signer before restoring it:
+
+```powershell
+Get-AuthenticodeSignature `
+    'C:\Program Files\Plex\Plex Media Server\Plex Transcoder Real.exe' |
+    Select-Object Status,@{Name='Signer';Expression={$_.SignerCertificate.Subject}}
+```
+
+The expected status is `Valid` and the signer should identify `Plex, Inc.`.
 
 ## Restore from an automatic backup
 

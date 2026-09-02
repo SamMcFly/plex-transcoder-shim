@@ -24,6 +24,14 @@ jobs:
         shell: pwsh
         run: .\tests\Test-Rewrite.ps1
 
+      - name: Test process forwarding and cleanup
+        shell: pwsh
+        run: .\tests\Test-EndToEnd.ps1
+
+      - name: Test install, repair, and rollback lifecycle
+        shell: pwsh
+        run: .\tests\Test-Management.ps1
+
       - name: Upload unsigned build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

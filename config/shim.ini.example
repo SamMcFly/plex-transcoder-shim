@@ -27,5 +27,6 @@ extra =
 # paths and session identifiers. Treat the log as private diagnostic data.
 log = 1
 log_max_mb = 5
-# logfile defaults to shim.log beside the installed executable.
+# logfile defaults to %LOCALAPPDATA%\PlexTranscoderShim\shim.log. An explicit
+# value must be absolute; Windows environment variables are expanded.
 # logfile = D:\Logs\plex-transcoder-shim.log

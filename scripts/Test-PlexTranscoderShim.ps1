@@ -42,7 +42,8 @@ param(
     [string] $ShimLog = '',      # blank = take it from shim.ini, then search
     [string] $ShimIni = '',      # blank = find shim.ini under $PlexDir
     [int]    $Hours   = 48,
-    [switch] $Quiet
+    [switch] $Quiet,
+    [switch] $AllowUnverifiedNative
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,6 +61,40 @@ function Add-Result {
     if ($Quiet -and $Status -in @('PASS','INFO')) { return }
     $colour = switch ($Status) { 'PASS' {'Green'} 'WARN' {'Yellow'} 'FAIL' {'Red'} default {'DarkGray'} }
     Write-Host ("  {0}  {1,-26} {2}" -f $Status.PadRight(4), $Check, $Detail) -ForegroundColor $colour
+}
+
+function ConvertFrom-ShimBoolean {
+    param([Parameter(Mandatory)][string]$Key,[AllowEmptyString()][string]$Value)
+    switch($Value.Trim().ToLowerInvariant()){
+        {$_ -in @('1','true','yes','on')} {return $true}
+        {$_ -in @('0','false','no','off')} {return $false}
+        default {throw "$Key must be one of: 1, 0, true, false, yes, no, on, off"}
+    }
+}
+
+function ConvertTo-Kbps {
+    param([Parameter(Mandatory)][double]$Number,[AllowEmptyString()][string]$Suffix)
+    switch($Suffix.ToLowerInvariant()){
+        'm' {return $Number * 1000.0}
+        'k' {return $Number}
+        default {return $Number / 1000.0}
+    }
+}
+
+function ConvertFrom-InvariantDouble {
+    param([Parameter(Mandatory)][string]$Key,[AllowEmptyString()][string]$Value)
+    $number=0.0
+    $valid=[double]::TryParse($Value,[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$number)
+    if(-not $valid -or [double]::IsNaN($number) -or [double]::IsInfinity($number)){throw "$Key is not a finite number"}
+    return $number
+}
+
+function Get-PlexSignatureInfo {
+    param([Parameter(Mandatory)][string]$Path)
+    $signature=Get-AuthenticodeSignature -LiteralPath $Path
+    $signer=if($signature.SignerCertificate){$signature.SignerCertificate.Subject}else{''}
+    $isPlex=$signature.Status -eq 'Valid' -and $signer -match '(?i)(CN|O)\s*=\s*"?Plex(?:,\s*|\s+)Inc\.?"?'
+    return [pscustomobject]@{Status=[string]$signature.Status;Signer=$signer;IsPlex=$isPlex}
 }
 
 Write-Host "`nPlex Transcoder shim check  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
@@ -90,6 +125,17 @@ if (-not (Test-Path -LiteralPath $real)) {
 $realItem = Get-Item -LiteralPath $real
 Add-Result 'Original preserved' 'PASS' `
     ("Plex Transcoder Real.exe - {0:N0} KB" -f ($realItem.Length / 1KB))
+
+$realSignature=Get-PlexSignatureInfo -Path $real
+if($realSignature.IsPlex){
+    Add-Result 'Original signature' 'PASS' 'valid Plex, Inc. Authenticode signature'
+}
+elseif($AllowUnverifiedNative){
+    Add-Result 'Original signature' 'WARN' "verification bypassed: status=$($realSignature.Status), signer='$($realSignature.Signer)'"
+}
+else{
+    Add-Result 'Original signature' 'FAIL' "not verified as Plex, Inc.: status=$($realSignature.Status), signer='$($realSignature.Signer)'"
+}
 
 # Hash comparison, not size. The real transcoder is a thin ~0.3 MB binary that
 # loads codecs from the external bundle, so size alone cannot tell them apart.
@@ -153,20 +199,53 @@ else {
     Add-Result 'shim.ini found' 'WARN' "not found under $PlexDir - shim will use built-in defaults"
 }
 
-# An installed shim with enabled=0 passes everything through untouched, which
-# looks healthy from every other angle.
+# A disabled or invalid Boolean passes everything through untouched, which can
+# look healthy from every other angle.
 if ($cfg.ContainsKey('enabled')) {
-    if ($cfg['enabled'] -eq '0') {
-        Add-Result 'Shim enabled' 'FAIL' 'enabled = 0 - the shim is installed but passing through unmodified'
+    try{
+        $shimEnabled=ConvertFrom-ShimBoolean -Key 'enabled' -Value $cfg['enabled']
+        if(-not $shimEnabled){
+            Add-Result 'Shim enabled' 'FAIL' "enabled = $($cfg['enabled']) - the shim is installed but passing through unmodified"
+        }
+        else{Add-Result 'Shim enabled' 'PASS' "enabled = $($cfg['enabled'])"}
     }
-    else { Add-Result 'Shim enabled' 'PASS' "enabled = $($cfg['enabled'])" }
+    catch{Add-Result 'Shim enabled' 'FAIL' $_.Exception.Message}
 }
 
-foreach ($k in 'codecs','bitrate_factor','bufsize_factor','priority','extra') {
+foreach ($k in 'codecs','priority','extra') {
     if ($cfg.ContainsKey($k)) {
         $v = if ($cfg[$k] -eq '') { '(empty)' } else { $cfg[$k] }
         Add-Result $k 'INFO' $v
     }
+}
+
+if($cfg.ContainsKey('codecs') -and [string]::IsNullOrWhiteSpace($cfg['codecs'])){
+    Add-Result 'codecs configuration' 'FAIL' 'codecs is empty; no encoder can be rewritten'
+}
+if($cfg.ContainsKey('bitrate_factor')){
+    try{
+        $factor=ConvertFrom-InvariantDouble -Key 'bitrate_factor' -Value $cfg['bitrate_factor']
+        if($factor -le 0 -or $factor -gt 1){throw 'bitrate_factor must be greater than 0 and no greater than 1.0'}
+        Add-Result 'bitrate_factor' 'INFO' $cfg['bitrate_factor']
+    }
+    catch{Add-Result 'bitrate_factor' 'FAIL' $_.Exception.Message}
+}
+if($cfg.ContainsKey('bufsize_factor')){
+    try{
+        $factor=ConvertFrom-InvariantDouble -Key 'bufsize_factor' -Value $cfg['bufsize_factor']
+        if($factor -lt 0 -or $factor -gt 10){throw 'bufsize_factor must be between 0 and 10.0'}
+        Add-Result 'bufsize_factor' 'INFO' $cfg['bufsize_factor']
+    }
+    catch{Add-Result 'bufsize_factor' 'FAIL' $_.Exception.Message}
+}
+if($cfg.ContainsKey('log_max_mb')){
+    $size=0L
+    if(-not [long]::TryParse($cfg['log_max_mb'],[Globalization.NumberStyles]::Integer,[Globalization.CultureInfo]::InvariantCulture,[ref]$size) -or $size -lt 1 -or $size -gt 1024){
+        Add-Result 'log_max_mb' 'FAIL' 'log_max_mb must be an integer between 1 and 1024'
+    }
+}
+if($cfg.ContainsKey('priority') -and $cfg['priority'] -and $cfg['priority'].ToLowerInvariant() -notin @('idle','belownormal','normal','abovenormal','high')){
+    Add-Result 'priority configuration' 'WARN' "priority '$($cfg['priority'])' is unsupported and will be ignored"
 }
 
 # ---------------------------------------------------------------------------
@@ -174,19 +253,36 @@ foreach ($k in 'codecs','bitrate_factor','bufsize_factor','priority','extra') {
 # ---------------------------------------------------------------------------
 Write-Host "`nActivity (last $Hours h)" -ForegroundColor Cyan
 
-if ($cfg.ContainsKey('log') -and $cfg['log'] -eq '0') {
-    Add-Result 'Logging' 'WARN' 'log = 0 in shim.ini - activity cannot be verified'
+$loggingEnabled=$true
+if($cfg.ContainsKey('log')){
+    try{$loggingEnabled=ConvertFrom-ShimBoolean -Key 'log' -Value $cfg['log']}
+    catch{Add-Result 'Logging configuration' 'FAIL' $_.Exception.Message}
+}
+
+if (-not $loggingEnabled) {
+    Add-Result 'Logging' 'WARN' "log = $($cfg['log']) in shim.ini - activity cannot be verified"
     Write-Host ''
 }
 else {
     # Prefer the path the ini declares; only guess if it does not say.
-    if (-not $ShimLog -and $cfg.ContainsKey('logfile')) { $ShimLog = $cfg['logfile'] }
+    if (-not $ShimLog -and $cfg.ContainsKey('logfile')) {
+        $ShimLog = [Environment]::ExpandEnvironmentVariables($cfg['logfile'])
+        if(-not [IO.Path]::IsPathRooted($ShimLog)){
+            Add-Result 'logfile' 'FAIL' 'logfile must be an absolute path'
+        }
+    }
     if (-not $ShimLog) {
-        foreach ($dir in @($PlexDir, $env:TEMP)) {
-            if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { continue }
-            $f = Get-ChildItem -LiteralPath $dir -Filter '*shim*.log' -File -ErrorAction SilentlyContinue |
-                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($f) { $ShimLog = $f.FullName; break }
+        $localData=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+        if($localData){
+            $defaultLog=Join-Path $localData 'PlexTranscoderShim\shim.log'
+            if(Test-Path -LiteralPath $defaultLog -PathType Leaf){$ShimLog=$defaultLog}
+        }
+    }
+    if(-not $ShimLog){
+        $legacyCandidates=@((Join-Path $PlexDir 'shim.log'))
+        if($env:TEMP){$legacyCandidates += (Join-Path $env:TEMP 'plex-transcoder-shim.log')}
+        foreach($candidate in $legacyCandidates){
+            if(Test-Path -LiteralPath $candidate -PathType Leaf){$ShimLog=$candidate;break}
         }
     }
 
@@ -225,19 +321,24 @@ else {
             }
             if ($when -and $when -lt $cut) { continue }
 
-            if ($line -match '\bIN\b') {
+            if ($line -match '\]\s+IN\s*:') {
                 $parsedAny = $true; $inCount++
                 if ($when) { $lastActivity = $when }
                 if ($line -notmatch '-maxrate:\d+\s+\d+') { $noAnchor++ }
             }
-            elseif ($line -match '\bOUT\b') {
+            elseif ($line -match '\]\s+OUT\s*:') {
                 $parsedAny = $true; $outCount++
                 if ($when) { $lastActivity = $when }
                 if ($line -match '-q:\d+\s') { $qSurvived++ }
 
                 $b = 0.0; $mr = 0.0
-                if ($line -match '-b:\d+\s+(\d+)k')       { $b  = [double]$Matches[1] }
-                if ($line -match '-maxrate:\d+\s+(\d+)k') { $mr = [double]$Matches[1]; $maxrates["$mr"] = 1 }
+                if ($line -match '-b:\d+\s+(?<n>\d+)(?<u>[kKmM]?)\b') {
+                    $b=ConvertTo-Kbps -Number ([double]$Matches['n']) -Suffix $Matches['u']
+                }
+                if ($line -match '-maxrate:\d+\s+(?<n>\d+)(?<u>[kKmM]?)\b') {
+                    $mr=ConvertTo-Kbps -Number ([double]$Matches['n']) -Suffix $Matches['u']
+                    $maxrates["$mr"] = 1
+                }
                 if ($b -gt 0 -and $mr -gt 0) { $ratios.Add([math]::Round($b / $mr, 3)) }
             }
         }

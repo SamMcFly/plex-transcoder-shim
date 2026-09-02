@@ -9,8 +9,9 @@
 //   * Operates on the RAW command line (Environment.CommandLine), never on a
 //     parsed argv. Round-tripping Plex's filter graphs through parse+requote
 //     is the most likely way to break this, so we simply don't.
-//   * Fails OPEN. Any error at all -> the real binary runs with the original,
-//     untouched command line. A bug here must never stop playback.
+//   * Argument rewriting fails open. Configuration or rewrite errors cause the
+//     real binary to run with the original, untouched command line. A missing
+//     or unlaunchable real executable cannot be recovered by a wrapper.
 //   * Puts itself in a Job Object with KILL_ON_JOB_CLOSE before spawning.
 //     Children inherit job membership, so when Plex kills this shim the real
 //     transcoder dies with it instead of orphaning and filling the temp disk.
@@ -28,6 +29,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 [assembly: AssemblyTitle("PlexTranscoderShim")]
 [assembly: AssemblyDescription("A fail-open Plex Transcoder rate-control wrapper for Windows")]
@@ -39,6 +41,7 @@ internal static class Shim
 {
     private const string RealExeName = "Plex Transcoder Real.exe";
     private const string ConfigName = "shim.ini";
+    private const string LogMutexName = @"Local\PlexTranscoderShim.Log";
 
     // ---- config (defaults are used if shim.ini is missing or unreadable) ----
     private static bool _enabled = true;
@@ -56,7 +59,7 @@ internal static class Shim
     private static int Main()
     {
         _exeDir = AppDomain.CurrentDomain.BaseDirectory;
-        _logFile = Path.Combine(_exeDir, "shim.log");
+        _logFile = GetDefaultLogFile();
 
         string original = StripOwnExe(Environment.CommandLine);
         string final = original;
@@ -232,9 +235,9 @@ internal static class Shim
 
             switch (key)
             {
-                case "enabled":        _enabled = IsTrue(val); break;
-                case "log":            _logEnabled = IsTrue(val); break;
-                case "logfile":        if (val.Length > 0) _logFile = val; break;
+                case "enabled":        _enabled = ParseBoolean(key, val); break;
+                case "log":            _logEnabled = ParseBoolean(key, val); break;
+                case "logfile":        if (val.Length > 0) _logFile = Environment.ExpandEnvironmentVariables(val); break;
                 case "log_max_mb":     _logMaxBytes = long.Parse(val, CultureInfo.InvariantCulture) * 1024 * 1024; break;
                 case "bitrate_factor": _bitrateFactor = double.Parse(val, CultureInfo.InvariantCulture); break;
                 case "bufsize_factor": _bufsizeFactor = double.Parse(val, CultureInfo.InvariantCulture); break;
@@ -252,10 +255,19 @@ internal static class Shim
         }
     }
 
-    private static bool IsTrue(string v)
+    private static bool ParseBoolean(string key, string value)
     {
-        v = v.Trim().ToLowerInvariant();
-        return v == "1" || v == "true" || v == "yes" || v == "on";
+        string v = value.Trim().ToLowerInvariant();
+        if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+        if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+        throw new InvalidDataException(key + " must be one of: 1, 0, true, false, yes, no, on, off");
+    }
+
+    private static string GetDefaultLogFile()
+    {
+        string root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrEmpty(root)) root = Path.GetTempPath();
+        return Path.Combine(root, "PlexTranscoderShim", "shim.log");
     }
 
     private static void ValidateConfig()
@@ -266,10 +278,13 @@ internal static class Shim
 
         if (double.IsNaN(_bufsizeFactor) || double.IsInfinity(_bufsizeFactor) ||
             _bufsizeFactor < 0.0 || _bufsizeFactor > 10.0)
-            throw new InvalidDataException("bufsize_factor must be 0 or between 0.1 and 10.0");
+            throw new InvalidDataException("bufsize_factor must be between 0 and 10.0");
 
         if (_logMaxBytes < 1024 * 1024 || _logMaxBytes > 1024L * 1024L * 1024L)
             throw new InvalidDataException("log_max_mb must be between 1 and 1024");
+
+        if (string.IsNullOrWhiteSpace(_logFile) || !Path.IsPathRooted(_logFile))
+            throw new InvalidDataException("logfile must be an absolute path");
     }
 
     // --------------------------------------------------------------- logging
@@ -279,13 +294,31 @@ internal static class Shim
         if (!_logEnabled) return;
         try
         {
-            if (File.Exists(_logFile) && new FileInfo(_logFile).Length > _logMaxBytes)
-                File.Delete(_logFile);
+            using (Mutex mutex = new Mutex(false, LogMutexName))
+            {
+                bool acquired = false;
+                try
+                {
+                    try { acquired = mutex.WaitOne(2000); }
+                    catch (AbandonedMutexException) { acquired = true; }
+                    if (!acquired) return;
 
-            File.AppendAllText(_logFile,
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
-                + " [" + Process.GetCurrentProcess().Id + "] " + RedactSensitiveLogText(message) + Environment.NewLine,
-                Encoding.UTF8);
+                    string directory = Path.GetDirectoryName(_logFile);
+                    if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+
+                    if (File.Exists(_logFile) && new FileInfo(_logFile).Length > _logMaxBytes)
+                        File.Delete(_logFile);
+
+                    File.AppendAllText(_logFile,
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                        + " [" + Process.GetCurrentProcess().Id + "] " + RedactSensitiveLogText(message) + Environment.NewLine,
+                        Encoding.UTF8);
+                }
+                finally
+                {
+                    if (acquired) mutex.ReleaseMutex();
+                }
+            }
         }
         catch { /* logging must never break a transcode */ }
     }
@@ -366,7 +399,7 @@ internal static class Shim
             catch (Exception ex)
             {
                 if (attempt == 2) TryLog("WARN: could not set priority: " + ex.Message);
-                else System.Threading.Thread.Sleep(50);
+                else Thread.Sleep(50);
             }
         }
     }

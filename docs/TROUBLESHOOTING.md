@@ -78,10 +78,26 @@ only substitution performed.
 
 ## Logs are not created
 
-With no `logfile` setting, the shim writes `shim.log` next to itself. Plex must
-have write permission there. If that location is not writable, set an absolute
-path in a directory writable by the Plex process. Logging failure never blocks
-a transcode.
+With no `logfile` setting, the shim writes to
+`%LOCALAPPDATA%\PlexTranscoderShim\shim.log` and creates the directory as
+needed. If Plex runs under a different account, its local application-data
+folder differs from the interactive user's; pass `-ShimLog` to the health
+checker or set an explicit absolute path writable by the Plex process. Windows
+environment variables are supported. Logging failure never blocks a transcode.
+
+## Native signature verification fails
+
+Confirm that the file came from the currently installed Plex version:
+
+```powershell
+Get-AuthenticodeSignature `
+    'C:\Program Files\Plex\Plex Media Server\Plex Transcoder Real.exe' |
+    Format-List Status,SignerCertificate
+```
+
+Repair or reinstall Plex if the file is unsigned, corrupted, or signed by an
+unexpected publisher. `-AllowUnverifiedNative` exists for certificate-chain
+problems and unusual builds, but it should only be used after manual inspection.
 
 Treat logs as private. See [SECURITY.md](../SECURITY.md).
 

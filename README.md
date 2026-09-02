@@ -1,9 +1,9 @@
 # PlexTranscoderShim
 
-PlexTranscoderShim is an unofficial, fail-open Windows wrapper for Plex Media
-Server's transcoder. It can replace quality-only rate control for selected
-hardware encoders with an explicit target bitrate derived from Plex's own
-`-maxrate` value.
+PlexTranscoderShim is an unofficial Windows wrapper for Plex Media Server's
+transcoder. Its argument-rewriting stage fails open: it can replace
+quality-only rate control for selected hardware encoders with an explicit
+target bitrate derived from Plex's own `-maxrate` value.
 
 The original use case is Intel Quick Sync HEVC (`hevc_qsv`) producing remote
 streams well above the requested bandwidth when Plex invokes it with `-q:N`.
@@ -38,6 +38,11 @@ The rewrite is deliberately narrow:
   through unchanged.
 - The real Plex transcoder's exit code and standard streams are preserved.
 
+Fail-open applies to configuration and argument rewriting, not every possible
+wrapper failure. If the shim itself cannot start, or the preserved native
+transcoder is missing or cannot launch, the wrapper cannot recover playback.
+The health checker and documented rollback procedure exist for those cases.
+
 The shim also places itself and the real transcoder in a Windows Job Object so
 the child should not be orphaned when Plex ends the wrapper. Job setup failure
 is non-fatal.
@@ -59,11 +64,20 @@ From the repository root:
 ```powershell
 .\scripts\Build.ps1
 .\tests\Test-Rewrite.ps1
+.\tests\Test-EndToEnd.ps1
+.\tests\Test-Management.ps1
 ```
 
 The executable and a working configuration are written to `dist\`. Generated
 binaries are intentionally not committed; build them locally or download the
 artifact from a successful GitHub Actions run.
+
+The end-to-end test compiles a disposable fake transcoder and verifies child
+argument forwarding, exit-code preservation, disabled and invalid-config
+pass-through, missing-child behavior, concurrent logging, and Job Object child
+cleanup. The management test exercises install, repair, enable/disable,
+manifest creation, and full rollback under an isolated temporary directory.
+Neither test touches the Plex installation.
 
 ## Install
 
@@ -88,6 +102,10 @@ The installer:
 3. Installs the shim as `Plex Transcoder.exe`.
 4. Copies the example configuration only if `shim.ini` does not already exist.
 
+Native files used for install, repair, and rollback must have a valid
+`Plex, Inc.` Authenticode signature. If certificate validation is unavailable,
+inspect the file first and use `-AllowUnverifiedNative` as an explicit override.
+
 For a non-default Plex directory, add `-PlexDirectory 'D:\path\to\Plex Media Server'`
 to management and health-check commands.
 
@@ -108,6 +126,11 @@ Review actual playback quality and bandwidth before relying on the result.
 Hardware, driver, media, subtitle, and Plex-version differences can all affect
 transcoding behavior.
 
+Before depending on a release, test the exact build with your Plex version and
+GPU driver. The initial development system used Plex Media Server
+`1.43.4.10903` on Windows 11; that is a compatibility data point, not a promise
+that other or future versions use the same command-line format.
+
 ## Configuration
 
 `shim.ini` is read on every invocation. Changes affect new transcodes without a
@@ -118,15 +141,17 @@ rebuild or Plex restart.
 | `enabled` | `1` | Emergency pass-through switch; `0` disables rewriting. |
 | `codecs` | `hevc_qsv` | Comma-separated eligible output encoders. |
 | `bitrate_factor` | `0.90` | Target bitrate as a fraction of `-maxrate`; valid range `(0, 1]`. |
-| `bufsize_factor` | `0` | Buffer as a multiple of `-maxrate`; `0` preserves Plex's value. |
+| `bufsize_factor` | `0` | Buffer as a multiple of `-maxrate`, from 0 through 10; `0` preserves Plex's value. |
 | `priority` | blank | Optional child CPU priority; `realtime` is refused. |
 | `extra` | blank | Raw extra arguments; `{i}` expands to the stream index. |
 | `log` | `1` | Enables rewrite and warning logs. |
 | `log_max_mb` | `5` | Log rollover threshold, from 1 through 1024 MB. |
-| `logfile` | beside shim | Optional absolute log path. |
+| `logfile` | `%LOCALAPPDATA%\PlexTranscoderShim\shim.log` | Optional absolute log path; environment variables are expanded. |
 
 Use `extra` only after testing the exact option with your encoder. It is
 inserted as literal command-line text and can break a transcode if malformed.
+Invalid Boolean values are rejected instead of being silently interpreted as
+false.
 
 ## Disable, uninstall, and Plex updates
 
