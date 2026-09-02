@@ -69,8 +69,9 @@ From the repository root:
 ```
 
 The executable and a working configuration are written to `dist\`. Generated
-binaries are intentionally not committed; build them locally or download the
-artifact from a successful GitHub Actions run.
+binaries are intentionally not committed; build them locally, download a
+versioned archive from GitHub Releases, or use the artifact from a successful
+GitHub Actions run.
 
 The end-to-end test compiles a disposable fake transcoder and verifies child
 argument forwarding, exit-code preservation, disabled and invalid-config
