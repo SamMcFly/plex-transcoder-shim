@@ -151,3 +151,7 @@ finally{
     [Environment]::SetEnvironmentVariable('PLEX_SHIM_TEST_SLEEP_MS',$oldSleep,'Process')
     if(Test-Path -LiteralPath $testRoot){Remove-Item -LiteralPath $testRoot -Recurse -Force}
 }
+
+# GitHub's PowerShell wrapper propagates a stale native-command exit code even
+# after all assertions pass (the missing-child test intentionally returns 127).
+$global:LASTEXITCODE=0
