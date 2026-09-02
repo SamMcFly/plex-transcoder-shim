@@ -1,0 +1,31 @@
+# PlexTranscoderShim configuration
+# Read for every new transcode; changing this file does not require a rebuild.
+
+# Emergency off switch. With enabled=0, arguments pass through unchanged.
+enabled = 1
+
+# Comma-separated output encoders eligible for rewriting.
+codecs = hevc_qsv
+
+# Target average bitrate = Plex -maxrate multiplied by this value.
+# Valid range: greater than 0 through 1.0. Start conservatively at 0.90.
+bitrate_factor = 0.90
+
+# Buffer size as a multiple of Plex -maxrate. Zero preserves Plex's value.
+bufsize_factor = 0
+
+# Optional child CPU priority:
+# idle | belownormal | normal | abovenormal | high
+# Blank preserves the priority assigned by Plex/Windows. Realtime is refused.
+priority =
+
+# Optional raw encoder arguments. {i} expands to the output stream index.
+# Leave blank unless the arguments have been tested with your encoder.
+extra =
+
+# Rewritten command lines are useful for verification but can contain local
+# paths and session identifiers. Treat the log as private diagnostic data.
+log = 1
+log_max_mb = 5
+# logfile defaults to shim.log beside the installed executable.
+# logfile = D:\Logs\plex-transcoder-shim.log
